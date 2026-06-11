@@ -1,0 +1,277 @@
+Perfect. Here's your complete build plan. 10 sprints, 2 weeks each — roughly 5 months total at your pace. Each sprint has a clear goal, a set of deliverables, and explicit callouts for where to slow down and go deep vs. where to just ship it.
+
+---
+
+# Right Hand — Build Plan
+
+## How to Read This Plan
+
+Each sprint ends with something **runnable and testable** — never a half-built abstraction. The hard parts are marked 🔴 (slow down, understand deeply). The fast parts are marked 🟢 (follow patterns, move on). Every sprint ends with an **Architecture Checkpoint** — a question you should be able to answer before moving forward.
+
+---
+
+## Sprint 1 — Foundation & Project Skeleton
+**Duration:** 2 weeks | **Goal:** A running Spring Boot app with the right structure from day one, never refactored later
+
+### What to Deliver
+- A multi-module Maven/Gradle project. One root project, one module per domain: `right-hand-identity`, `right-hand-people`, `right-hand-interactions`, `right-hand-events`, `right-hand-gifts`, `right-hand-intelligence`, `right-hand-timeline`, and a `right-hand-api` module that is the Spring Boot entry point and wires everything together
+- Each module has the three-layer package structure inside it from the start: `domain`, `application`, `infrastructure`
+- Docker Compose file that starts PostgreSQL, Redis, and Kafka with a single command. No installation of anything locally except Docker and a JDK
+- Flyway configured and running — even if the only migration is creating a `schema_version` table
+- A `/health` endpoint that returns the status of every infrastructure dependency
+- ArchUnit test suite scaffolded with two rules enforced from day one: no `infrastructure` class may be imported by `domain`, and no module may import another module's `infrastructure` package
+
+### Where to Slow Down 🔴
+The multi-module project structure. Get this right now. Understand how Maven/Gradle handles inter-module dependencies, why you declare `right-hand-api` as depending on all domain modules but domain modules never depend on each other, and what `implementation` vs `api` scope means in this context. Mistakes here cause pain for the entire project.
+
+### Move Fast On 🟢
+Docker Compose setup. Use a standard Postgres + Kafka + Redis compose template, adjust the versions, and move on.
+
+### Architecture Checkpoint
+*Can you explain why the `right-hand-api` module exists separately from all domain modules, and what would go wrong if you put Spring controllers directly inside `right-hand-people`?*
+
+---
+
+## Sprint 2 — Identity Domain & Security Foundation
+**Duration:** 2 weeks | **Goal:** A secured application with working auth before a single business feature exists
+
+### What to Deliver
+- `User` aggregate in `right-hand-identity` domain layer: id, profile fields, communication style preferences, sensitivity tier enum. Pure Java, no JPA annotations
+- JPA entity in the infrastructure layer that maps to the `User` aggregate — these are two separate classes intentionally
+- Spring Authorization Server configured as the OAuth2 server: authorization code flow with PKCE, access token (15 min TTL), refresh token (30 day TTL) with rotation on every use
+- A `DeviceSession` table that records active refresh tokens alongside device fingerprint and last seen timestamp
+- Refresh token family invalidation: when a refresh token is used after already being rotated (theft detection), all sessions for that user are terminated. This is a single table query + delete
+- Spring Security configured on `right-hand-api` to validate JWTs issued by your own authorization server. Every endpoint except `/health` and the auth endpoints requires a valid token
+- Integration test using Testcontainers that starts Postgres, registers a user, does a full PKCE flow, gets a token, rotates it, and hits a secured endpoint
+
+### Where to Slow Down 🔴
+The PKCE flow and refresh token rotation logic. Read the OAuth2 RFC sections on PKCE and token rotation. Understand what `code_verifier` and `code_challenge` are and why PKCE exists. Understand what token family tracking means and why invalidating the whole family matters. This is security — half-understanding it means a broken security model that feels like it works.
+
+### Move Fast On 🟢
+The `User` profile fields and communication style preferences. Just get them in the schema and move on — you'll never touch them again until Sprint 10.
+
+### Architecture Checkpoint
+*If an attacker steals a refresh token and uses it after the legitimate user already rotated it, walk through exactly what your system does step by step.*
+
+---
+
+## Sprint 3 — People & Relationship Graph Domain
+**Duration:** 2 weeks | **Goal:** The core data model of the entire system is solid and queryable
+
+### What to Deliver
+- `Contact` aggregate with all its layers: basic facts, relationship metadata, closeness tier, life chapters. Domain layer only — no Spring
+- `Relationship` entity connecting two contacts with a relationship type. This is a self-referencing join on the contacts table
+- Flyway migrations for `contacts`, `contact_life_chapters`, and `contact_relationships` tables
+- CRUD API for contacts and relationships via REST — this is the one domain where CRUD is the right pattern, so move fast on it
+- The graph traversal query: given a contact ID, return all contacts within N hops. Write this as a recursive CTE in PostgreSQL. Expose it as a `GET /contacts/{id}/network?depth=2` endpoint
+- A `ContactQueryFacade` interface in `right-hand-people`'s application layer — this is the only way any other module will ever read contact data. Even though nothing uses it yet, define it now
+- Load test the graph traversal with 1,000 contacts and 5,000 relationships seeded via a Flyway test migration. Query must return in under 100ms. Add a partial index if it doesn't
+
+### Where to Slow Down 🔴
+The recursive CTE query. Understand `WITH RECURSIVE`, the base case, the recursive case, and the cycle prevention clause. Run `EXPLAIN ANALYZE` on it before and after adding the index. Read what the query planner is doing. This is one of the most valuable SQL skills you'll gain in this project.
+
+### Move Fast On 🟢
+The REST CRUD for contacts. Basic Spring MVC controller, service, repository. No special patterns needed here.
+
+### Architecture Checkpoint
+*Why is `ContactQueryFacade` an interface defined in the `application` layer of `right-hand-people` rather than just letting other modules call the repository directly? What would break if you skipped it?*
+
+---
+
+## Sprint 4 — Interaction Logging & The Outbox Pattern
+**Duration:** 2 weeks | **Goal:** Your first event-driven flow, done correctly with guaranteed delivery
+
+### What to Deliver
+- `Interaction` aggregate: type, mood tag, participants (list of contact IDs), free-text notes, timestamp. Domain layer
+- `LifeFact` value object: a structured extraction from interaction notes — a fact about a contact with a type, value, and expiry model. Domain layer
+- REST endpoint to log an interaction: `POST /interactions`. This is a command, not CRUD — it triggers a use case, not a repository save
+- The Outbox Pattern fully implemented: the interaction save and the outbox record write happen in a single `@Transactional` block. A separate `@Scheduled` poller reads unprocessed outbox records and publishes them to Kafka, then marks them processed. Handle the case where the poller crashes mid-publish
+- Kafka topic `interaction.logged` with an Avro schema registered in the Schema Registry. The event payload includes interaction ID, participant contact IDs, and the raw notes text
+- A Kafka consumer in `right-hand-intelligence` that listens to `interaction.logged` — for now it just logs receipt. You will fill it in Sprint 7
+- Idempotency on the consumer: before processing, check a Redis key `processed:{eventId}`. If it exists, skip. If not, process and set the key with a 24h TTL
+
+### Where to Slow Down 🔴
+The Outbox Pattern. Understand every failure scenario: what happens if the app crashes after the DB write but before the poller runs? What happens if the poller publishes to Kafka but crashes before marking the record processed? What happens if the same outbox record is published twice? Write a test that simulates each of these by using Testcontainers and killing things at the right moment.
+
+Also slow down on Avro schema design. Think about what fields the event needs, what's optional, and how you'd add a field six months from now without breaking existing consumers. Read about schema evolution rules in Avro.
+
+### Move Fast On 🟢
+The interaction REST endpoint and the basic domain model. The domain model here is not complex — just get it right and move on.
+
+### Architecture Checkpoint
+*Your outbox poller publishes an event to Kafka successfully but then the app crashes before it can mark the outbox record as processed. The poller runs again on restart and publishes the same event again. Walk through exactly how your consumer handles this duplicate without producing a duplicate LifeFact.*
+
+---
+
+## Sprint 5 — Events, Occasions & Follow-Ups
+**Duration:** 2 weeks | **Goal:** The system knows about time-sensitive relationship obligations
+
+### What to Deliver
+- `Occasion` aggregate: type, contact it belongs to, date, recurrence flag, preparation lead time (derived from contact's closeness tier)
+- `ActionPlan` entity: generated plan for an upcoming occasion, stored as a JSONB document in Postgres. It has a status: `PENDING_GENERATION`, `READY`, `DISMISSED`
+- `FollowUp` aggregate: a commitment the user logged, with a deadline, linked contact, and status: `OPEN`, `DONE`, `OVERDUE`
+- REST endpoints for occasions and follow-ups CRUD
+- A Spring Batch job that runs nightly: scans all occasions within the next 60 days, checks which ones have no `ActionPlan` yet, and creates a `PENDING_GENERATION` plan record for each. This is not the generation itself — just the queuing
+- A scheduled task that scans `OPEN` follow-ups past their deadline and flips them to `OVERDUE`, then publishes a `followup.overdue` Kafka event
+- `GET /dashboard/upcoming` endpoint: returns occasions in the next 30 days + overdue follow-ups + open follow-ups due this week, assembled from both domains via their respective `QueryFacade` interfaces. This endpoint must not JOIN across module tables — it calls two facades and merges in application code
+
+### Where to Slow Down 🔴
+The Spring Batch job structure. Understand `Job`, `Step`, `ItemReader`, `ItemProcessor`, `ItemWriter`. Understand chunk-oriented processing and why you process 50 occasions at a time rather than all 500 at once. Understand job restartability — if the batch job fails halfway, it should resume from where it stopped, not restart from the beginning.
+
+Also understand the JSONB `ActionPlan` decision. Why is the action plan stored as JSONB rather than normalized tables? What are the trade-offs? Write this reasoning in a comment in your migration file.
+
+### Move Fast On 🟢
+The CRUD for occasions and follow-ups. Straightforward Spring MVC + JPA.
+
+### Architecture Checkpoint
+*The `/dashboard/upcoming` endpoint calls two query facades and merges data in the application layer. Someone on your team suggests just doing a JOIN across the `occasions` and `follow_ups` tables since they're in the same database. Give three specific reasons why you won't do that even though it would be simpler.*
+
+---
+
+## Sprint 6 — Gift Intelligence Domain
+**Duration:** 2 weeks | **Goal:** A functional gift history and rule-based suggestion engine
+
+### What to Deliver
+- `GiftRecord` aggregate: what was given, occasion, cost tier, reception observation, gift category (physical/experiential/handmade)
+- `WishSignal` entity: an interest or desire observed about a contact, with a source (manual entry or extracted from interaction notes), and an `actedUpon` flag
+- `GiftBlacklist` entity: per-contact list of categories, specific items, or dietary restrictions to exclude
+- `GiftBudget` entity: annual budget per closeness tier, with a running spend total per contact per calendar year
+- The gift suggestion scorer: a Java class in the domain layer (no Spring, no DB) that takes a contact's interest profile, wish signals, blacklist, past gifts, remaining budget, and occasion type, and returns a ranked list of `GiftSuggestion` value objects with a score and reasoning string. Build this as a pure scoring function with configurable weights
+- `GET /contacts/{id}/gift-suggestions?occasion=BIRTHDAY` endpoint that assembles all inputs, calls the scorer, and returns ranked suggestions
+- The suggestion query that ranks results: this is a single SQL query using window functions that pulls wish signals ordered by recency, past gifts ordered by date, and budget remaining — write it in SQL, not in application-layer loops
+- Unit tests for the scorer with at least 8 scenarios: contact with no wish signals, contact with blacklisted categories, budget exhausted, repeated gift detection, etc.
+
+### Where to Slow Down 🔴
+The scorer design. This is a domain logic problem. Think carefully about how you model the scoring weights, how you make them configurable without a rebuild, and how you ensure the scorer is fully testable without any infrastructure. This is where hexagonal architecture pays off most visibly — the scorer is the purest piece of domain logic in the whole system.
+
+Also the window function SQL query. Understand `RANK()`, `ROW_NUMBER()`, `PARTITION BY`, and `ORDER BY` inside window functions. Run `EXPLAIN ANALYZE` on it.
+
+### Move Fast On 🟢
+The CRUD for gift records, wish signals, and blacklist entries. Standard patterns.
+
+### Architecture Checkpoint
+*Your gift scorer is a plain Java class with no Spring annotations. How do you get contact data, wish signals, and past gifts into it? Trace the call from the HTTP request all the way through the application layer to the scorer and back, naming each class involved.*
+
+---
+
+## Sprint 7 — Intelligence Layer: Fact Extraction & Nudge Engine
+**Duration:** 2 weeks | **Goal:** The system becomes proactive — it notices things and surfaces them
+
+### What to Deliver
+- Fill in the `right-hand-intelligence` Kafka consumer from Sprint 4: when `interaction.logged` is received, parse the notes text using a rule-based extractor (regex + keyword matching — no LLM here) and produce `LifeFact` candidates. Publish `lifefact.extracted` events
+- A second consumer that listens to `lifefact.extracted` and writes confirmed facts to the `contact_life_facts` table via the `right-hand-people` module's inbound port. This consumer is idempotent
+- `LifeFact` expiry model: facts have a `validUntil` field. A nightly Spring Batch step scans for facts past their expiry and sets them to `STALE`, then publishes a `lifefact.stale` event
+- The Nudge Engine as a Spring Batch job: runs every morning, processes all contacts in chunks of 50, evaluates each contact against a set of nudge rules, and produces `Nudge` records. Nudge rules are individual classes implementing a `NudgeRule` interface — one class per rule type: `RelationshipGapRule`, `OverdueFollowUpRule`, `UpcomingOccasionRule`, `StaleLifeFactRule`
+- Nudge priority scoring: each nudge gets an urgency score (days until something expires or becomes problematic) and an importance score (closeness tier weight). The daily nudge queue is the top 7 nudges by combined score
+- `GET /nudges/today` endpoint returning today's ranked nudge queue
+- `POST /nudges/{id}/dismiss` to mark a nudge handled
+
+### Where to Slow Down 🔴
+The NudgeRule interface design. This is a strategy pattern applied to a real problem. Think about what data each rule needs, how you pass it in without coupling rules to the database, and how you make it trivially easy to add a new rule later without touching existing code. Write the interface contract before writing any implementation.
+
+Also the consumer chain: `interaction.logged` → fact extractor → `lifefact.extracted` → contact updater. Draw this on paper before you code it. Understand what happens when the second consumer fails — does the first consumer's work get lost? How does Kafka consumer offset management save you here?
+
+### Move Fast On 🟢
+The individual `NudgeRule` implementations once the interface is solid. Each rule is a small, focused class. Write them quickly once the contract is clear.
+
+### Architecture Checkpoint
+*The nudge engine runs at 6am and produces 7 nudges. At 8am the user dismisses 3 of them. At 10am a new interaction is logged that makes another nudge irrelevant. How does your system handle this? What are the edge cases and which ones are you explicitly accepting as limitations?*
+
+---
+
+## Sprint 8 — LLM Integration: Message Drafting
+**Duration:** 2 weeks | **Goal:** The most architecturally interesting feature — async LLM calls done correctly
+
+### What to Deliver
+- `DraftRequest` aggregate: created when the user asks for a message draft. Status: `QUEUED`, `GENERATING`, `READY`, `FAILED`. Stored in Postgres
+- `POST /drafts` endpoint: accepts a contact ID and optional intent ("checking in", "congratulating on promotion"). Returns `202 Accepted` with a `draftId` immediately — never blocks on the LLM call
+- A Kafka topic `draft.requested` that the POST handler publishes to after creating the `DraftRequest` record (via the outbox)
+- A consumer in `right-hand-intelligence` that listens to `draft.requested`, assembles the full context payload (recent interactions, life facts, upcoming occasions, relationship health, contact profile), constructs a prompt, calls the Claude API, and writes the result back to the `DraftRequest` record
+- The context assembly is the most important part: you are building a structured context document from 5 different data sources. Each source is fetched through its query facade. The final prompt must be deterministic and testable — extract it into a `PromptBuilder` class that takes the assembled context and returns the prompt string
+- `GET /drafts/{id}` endpoint: returns the draft if ready, or the current status if not
+- A Server-Sent Events endpoint `GET /drafts/{id}/stream` that the client can connect to and receive the draft the moment it becomes ready, without polling
+- LLM response caching in Redis: cache the response keyed by a hash of the prompt. TTL 1 hour. If the same contact + intent is requested again within the hour, return cached. Add a `cached: true` field to the response
+- WireMock tests for the Claude API call: test the happy path, a 429 rate limit response with retry, and a malformed response
+
+### Where to Slow Down 🔴
+The async flow design end-to-end. Trace every step: HTTP request → outbox write → Kafka publish → consumer receives → context assembled → LLM called → result written → SSE pushed. Understand where failures can happen at each step and what the user experiences in each case. This is the most complete demonstration of async-first architecture in the project.
+
+The `PromptBuilder` class. The quality of the LLM output is entirely determined by the quality of the context you pass it. Think about what information actually matters for drafting a message, how you format it, and how you prevent sensitive `PRIVATE`-tier facts from leaking into the prompt. Write unit tests for the prompt builder with various contact configurations.
+
+### Move Fast On 🟢
+The `GET /drafts/{id}` polling endpoint. Straightforward repository lookup.
+
+### Architecture Checkpoint
+*Why does the `POST /drafts` endpoint return 202 instead of waiting for the LLM response? What would break in the system — not just performance, but structurally — if you made the LLM call synchronously inside the request thread?*
+
+---
+
+## Sprint 9 — Timeline, Search & Relationship Health
+**Duration:** 2 weeks | **Goal:** The system's memory becomes queryable and the health model comes alive
+
+### What to Deliver
+- The unified `SocialTimeline` query: a single SQL query using `UNION ALL` across interactions, occasions, and life events, ordered by timestamp, paginated with cursor-based pagination (not offset). Expose as `GET /timeline?before={cursor}&limit=20`
+- Per-contact timeline endpoint: `GET /contacts/{id}/timeline` — same structure but filtered to one contact, with life chapters overlaid as context windows in the response
+- Full-text search using PostgreSQL `tsvector`: a `search_vector` column on the `contact_life_facts` and `interactions` tables, populated by a Postgres trigger on insert/update. `GET /search?q=jazz+musician` must search across both tables and return ranked results with the contact they belong to
+- Relationship health score: a computed value per contact, stored as a materialized column updated by the nightly batch job. The formula is your design, but it must incorporate: days since last interaction (weighted by closeness tier), interaction sentiment trend (average mood tag over last 5 interactions), reciprocity signal (user-logged vs. contact-initiated interactions ratio), and milestone acknowledgment rate
+- `GET /contacts/{id}/health` returns current score, trend direction (improving/stable/declining), and the three biggest contributing factors as human-readable strings
+- The Annual Report batch job: a multi-step Spring Batch job that aggregates interaction counts per contact, computes who the user spent the most time with, lists all occasions acknowledged vs. missed, and assembles a `RelationshipYearReport` JSONB document. `GET /reports/annual/{year}` returns it
+
+### Where to Slow Down 🔴
+Cursor-based pagination. Understand why offset pagination breaks on large datasets and how a cursor (typically the last seen ID or timestamp) solves it. Understand how to make the cursor opaque to the client (base64 encode it) while keeping it meaningful to the server. Write a test that pages through 200 timeline entries and verifies no duplicates and no gaps.
+
+The `tsvector` full-text search setup. Understand the difference between `to_tsvector` and `plainto_tsquery`, what a GIN index does for full-text search, and why you're using a trigger rather than computing it at query time. Run `EXPLAIN ANALYZE` on a search query before and after the GIN index.
+
+### Move Fast On 🟢
+The relationship health formula itself. Pick reasonable weights, implement it, and move on. It doesn't need to be perfect — it needs to be architecturally sound (computed in batch, stored as a column, never computed inline on a request).
+
+### Architecture Checkpoint
+*Your `SocialTimeline` query uses `UNION ALL` across three tables. Someone suggests this should instead be an Elasticsearch index for better search performance. Make the case for keeping it in PostgreSQL at this stage, and describe exactly what signal would tell you it's time to move to Elasticsearch.*
+
+---
+
+## Sprint 10 — Observability, Hardening & The Architecture Review
+**Duration:** 2 weeks | **Goal:** The system is production-honest and you can demonstrate mastery of every decision made
+
+### What to Deliver
+- Micrometer metrics wired to Prometheus for: nudge engine run duration, LLM API call latency and failure rate, Kafka consumer lag per topic, relationship health score distribution as a histogram, draft generation end-to-end latency (from `POST /drafts` to `READY` status)
+- OpenTelemetry distributed tracing: trace a single `POST /interactions` call through the outbox poller, through Kafka, through the fact extractor consumer, through the life fact writer, and into the nudge evaluator. All spans connected under one trace ID
+- Grafana dashboard with 5 panels: system health overview, LLM API performance, Kafka consumer lag, nudge engine stats, and relationship health distribution across all contacts
+- Application-layer encryption for `PRIVATE`-tier life facts: AES-256 encryption of the fact value before Postgres write, decryption on read. Key derived from a user secret stored in Redis session. Write a test that dumps the raw Postgres row and confirms the value column is unreadable
+- ArchUnit full coverage: every architectural rule enforced at test time. Run the suite and fix every violation. The suite becomes a non-negotiable part of the build
+- A load test using Gatling: simulate 6 months of relationship activity — 1,000 contacts, 10,000 interactions logged, nudge engine run, 500 draft requests — and verify no endpoint degrades beyond acceptable thresholds
+- Write a 2-page architecture decision record (ADR) for the three most consequential decisions you made: why modular monolith over microservices, why the outbox pattern for event publishing, and why PostgreSQL full-text search over Elasticsearch. Each ADR has: context, decision, consequences (positive and negative)
+
+### Where to Slow Down 🔴
+The ADR writing. This is not documentation for its own sake. The act of writing why you made each decision, what alternatives you considered, and what you gave up forces you to understand your own system at a level most engineers never reach. If you can't write a coherent ADR for a decision, you don't fully understand it yet. Go back and re-examine it until you can.
+
+The distributed trace. Getting a trace that spans from an HTTP request through Kafka through two consumers requires understanding how OpenTelemetry propagates context across async boundaries via Kafka headers. This is non-trivial and genuinely teaches you something about distributed observability.
+
+### Move Fast On 🟢
+The Grafana dashboard. Pick five metrics, wire up five panels, move on. Dashboards are iterative.
+
+### Architecture Checkpoint — Final
+*Someone hands you this system and asks: "Where would this break first if the user's contact list grew to 10,000 people?" Walk through every component — the nudge engine batch job, the graph traversal query, the timeline pagination, the LLM draft assembly, the health score computation — and give a specific, technically grounded answer for each one.*
+
+---
+
+## The Full Timeline at a Glance
+
+| Sprint | Focus | Key Deliverable |
+|---|---|---|
+| 1 | Foundation | Multi-module project, Docker Compose, ArchUnit scaffolded |
+| 2 | Security | OAuth2 + PKCE, refresh token rotation, secured endpoints |
+| 3 | People Graph | Contact model, recursive CTE graph traversal, query facades |
+| 4 | Interactions | Outbox Pattern, Kafka pipeline, idempotent consumers |
+| 5 | Events | Spring Batch, occasions, follow-ups, dashboard endpoint |
+| 6 | Gifts | Scorer design, window function SQL, WishSignals |
+| 7 | Intelligence | Fact extraction pipeline, NudgeRule strategy pattern |
+| 8 | LLM Drafting | Async draft flow, SSE, PromptBuilder, Redis caching |
+| 9 | Timeline & Health | Cursor pagination, full-text search, health score batch |
+| 10 | Hardening | Tracing, encryption, load test, ADRs |
+
+---
+
+## One Rule Above All Others
+
+Every sprint ends with a running, testable system. You never carry broken code into the next sprint. If a sprint's goal is too large, cut scope — but never cut tests and never cut the architecture boundaries. The boundaries are the project.
